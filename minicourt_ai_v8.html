@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>MiniCourt AI v8</title>
+<style>
+*{box-sizing:border-box}body{margin:0;padding:14px;background:#101a17;color:#f3f7f4;font:16px system-ui,-apple-system,sans-serif}
+main{max-width:850px;margin:auto;display:grid;gap:12px}.panel{background:#1b2a24;border:1px solid #34483e;border-radius:15px;padding:14px}
+h1{font-size:23px;margin:0 0 4px}.muted,.note{color:#afc0b5}.note{font-size:13px;line-height:1.45}
+#screen{width:100%;height:auto;min-height:190px;max-height:55vh;object-fit:contain;background:#050907;border-radius:10px;display:block}
+.buttons{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}button{border:0;border-radius:10px;padding:12px 14px;background:#315c43;color:white;font-weight:700;font-size:14px}button.primary{background:#b5f3c5;color:#102016}button:disabled{opacity:.45}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.stat{background:#263a30;padding:10px;border-radius:10px}.stat span{display:block;color:#afc0b5;font-size:11px}.stat strong{font-size:24px}
+#call{text-align:center;font-size:27px;font-weight:850;color:#b5f3c5;padding:12px}
+#zoom{position:absolute;right:12px;top:12px;width:116px;height:116px;border:2px solid #b5f3c5;border-radius:50%;overflow:hidden;background:#07100b;display:none;pointer-events:none}
+#zoom canvas{width:100%;height:100%}
+.canvaswrap{position:relative}
+#screen{touch-action:manipulation}
+#cornerhint{font-size:13px;color:#d8eadf;margin-top:7px}
+label{display:block;margin:9px 0 3px;color:#afc0b5;font-size:13px}input{width:100%}
+</style>
+</head>
+<body><main>
+<header><h1>🎾 MiniCourt AI <small class="muted">v8</small></h1><div id="status" class="muted">Ready · camera off</div></header>
+<section class="panel">
+<video id="video" playsinline muted style="display:none"></video>
+<div class="canvaswrap"><canvas id="screen" width="640" height="360"></canvas><div id="zoom"><canvas id="zoomcanvas" width="220" height="220"></canvas></div></div>
+<div class="buttons">
+<button class="primary" id="camera">Start camera</button>
+<button id="autocourt" disabled>Auto-detect court</button>
+<button id="calibrate" disabled>Set court corners</button>
+<button id="undo" disabled>Undo corner</button>
+<button id="clearcourt" disabled>Clear court</button>
+<button id="play" disabled>Start rally</button>
+<button id="voice">Voice: ON</button>
+<button id="reset">Reset</button>
+</div>
+<p class="note" id="message">Start the camera. The app will look for the white tape automatically. If it cannot find the court reliably, use Set court corners to mark it manually.</p>
+</section>
+<section class="panel">
+<div class="stats">
+<div class="stat"><span>RALLY COUNT</span><strong id="rallies">0</strong></div>
+<div class="stat"><span>POINTS ENDED</span><strong id="points">0</strong></div>
+<div class="stat"><span>BALL TRACK</span><strong id="track">OFF</strong></div>
+</div>
+<div id="call">READY</div>
+<p class="note">Referee voice uses your device’s speech voice with a slower, formal umpire-style delivery. The app looks for white court tape when the camera starts. You can retry Auto-detect court or adjust the green corners manually. Calls are made only on a detected downward-to-upward ground-bounce pattern; racket contact alone is not a call.</p>
+</section>
+</main>
+<script>
+(() => {
+'use strict';
+const el = id => document.getElementById(id);
+const video=el('video'), canvas=el('screen'), ctx=canvas.getContext('2d');
+let media=null, frame=0, voiceOn=true, selecting=false, dragging=-1, corners=[], court=[], playing=false;
+let rallyCount=0, pointCount=0, lastBall=null, lastTime=0, lastTurn=0, missStart=0, bounceCount=0, pointFinished=false;
+function status(s){el('status').textContent=s}
+function say(s){
+  if(!voiceOn || !('speechSynthesis' in window)) return;
+  try {
+    window.speechSynthesis.cancel();
+    const u=new SpeechSynthesisUtterance(s);
+    u.lang='en-US'; u.rate=0.86; u.pitch=0.82; u.volume=1;
+    const voices=window.speechSynthesis.getVoices();
+    const preferred=voices.find(v=>/^en-US$/i.test(v.lang) && /Samantha|Alex|Daniel|Google US English/i.test(v.name))
+      || voices.find(v=>/^en-US/i.test(v.lang));
+    if(preferred) u.voice=preferred;
+    window.speechSynthesis.speak(u);
+  } catch(e){}
+}
+function call(title,message,spoken){
+  el('call').textContent=title; el('message').textContent=message;
+  if(spoken) say(spoken);
+}
+function inside(p, poly){
+  let yes=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const a=poly[i],b=poly[j];
+    if(((a.y>p.y)!==(b.y>p.y)) && p.x<(b.x-a.x)*(p.y-a.y)/(b.y-a.y)+a.x) yes=!yes;
+  }
+  return yes;
+}
+function stopCamera(){
+  if(media){media.getTracks().forEach(t=>t.stop());media=null;}
+  cancelAnimationFrame(frame); playing=false; selecting=false;
+  el('camera').textContent='Start camera';el('calibrate').disabled=true;el('autocourt').disabled=true;el('play').disabled=true;
+  status('Camera off');el('track').textContent='OFF';
+}
+async function startCamera(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    call('CAMERA NOT AVAILABLE','This page is not running in a secure browser context. Open it from your HTTPS GitHub Pages address in Safari, not from a file preview.');return;
+  }
+  try{
+    status('Requesting camera permission…');
+    media=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'}}});
+    video.srcObject=media;
+    await video.play();
+    canvas.width=video.videoWidth||1280;canvas.height=video.videoHeight||720;
+    el('camera').textContent='Stop camera';el('calibrate').disabled=false;el('autocourt').disabled=false;el('play').disabled=true;
+    status('Camera on');call('SCANNING FOR COURT','Looking for the four white-tape boundaries. Keep the whole court visible.','Scanning for court');
+    drawLoop();
+    setTimeout(()=>{ if(media && court.length!==4) autoDetectCourt(); },700);
+  }catch(err){
+    stopCamera();status('Camera failed');
+    let msg='Camera could not start: '+(err && err.message ? err.message : String(err));
+    if(err && (err.name==='NotAllowedError'||err.name==='PermissionDeniedError')) msg+=' Check Safari camera permission in Settings.';
+    if(err && err.name==='NotFoundError') msg+=' No camera was found.';
+    call('CAMERA ERROR',msg);
+  }
+}
+function drawLoop(){
+  if(!media)return;
+  try{
+    ctx.drawImage(video,0,0,canvas.width,canvas.height);
+    const visible=court.length===4?court:corners;
+    if(visible.length>=2){
+      ctx.beginPath();ctx.moveTo(visible[0].x,visible[0].y);visible.slice(1).forEach(p=>ctx.lineTo(p.x,p.y));
+      if(visible.length===4)ctx.closePath();
+      ctx.strokeStyle='#b5f3c5';ctx.lineWidth=Math.max(3,canvas.width/300);ctx.stroke();
+      if(visible.length===4){ctx.fillStyle='rgba(181,243,197,.10)';ctx.fill();}
+    }
+    visible.forEach((p,i)=>{
+      ctx.fillStyle='#b5f3c5';ctx.beginPath();ctx.arc(p.x,p.y,Math.max(10,canvas.width*.012),0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle='#102016';ctx.lineWidth=3;ctx.stroke();
+      ctx.fillStyle='#102016';ctx.font=`bold ${Math.max(14,canvas.width*.018)}px system-ui`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(String(i+1),p.x,p.y);
+    });
+    if(playing) detectBall();
+  }catch(err){call('TRACKING ERROR',err.message);playing=false;}
+  frame=requestAnimationFrame(drawLoop);
+}
+
+
+// Detect two pairs of roughly parallel bright, low-saturation white tape lines.
+function autoDetectCourt(){
+  if(!media){call('START CAMERA FIRST','Start the camera before scanning for the court.');return false;}
+  const w=320, h=Math.max(1,Math.round(canvas.height*w/canvas.width));
+  const tmp=document.createElement('canvas');tmp.width=w;tmp.height=h;
+  const tc=tmp.getContext('2d',{willReadFrequently:true});
+  tc.drawImage(video,0,0,w,h);
+  const pixels=tc.getImageData(0,0,w,h).data;
+  const points=[];
+  for(let y=2;y<h-2;y+=1){
+    for(let x=2;x<w-2;x+=1){
+      const i=(y*w+x)*4,r=pixels[i],g=pixels[i+1],b=pixels[i+2];
+      const hi=Math.max(r,g,b),lo=Math.min(r,g,b);
+      if(hi>178 && hi-lo<58 && (r+g+b)/3>174) points.push([x,y]);
+    }
+  }
+  if(points.length<100){
+    call('COURT NOT FOUND','I could not see enough bright white tape. Improve the lighting or contrast, then retry Auto-detect court. You can also set the corners manually.');
+    return false;
+  }
+  const thetaCount=90, diag=Math.ceil(Math.hypot(w,h)), rhoCount=diag*2+1;
+  const acc=new Uint16Array(thetaCount*rhoCount);
+  const cos=[],sin=[];
+  for(let t=0;t<thetaCount;t++){const a=t*Math.PI/90;cos[t]=Math.cos(a);sin[t]=Math.sin(a);}
+  // Vote every second white pixel to keep the scan quick on iPad.
+  for(let k=0;k<points.length;k+=2){
+    const [x,y]=points[k];
+    for(let t=0;t<thetaCount;t++){
+      const rho=Math.round(x*cos[t]+y*sin[t])+diag;
+      acc[t*rhoCount+rho]++;
+    }
+  }
+  const peaks=[];
+  for(let t=0;t<thetaCount;t++){
+    for(let r=2;r<rhoCount-2;r++){
+      const votes=acc[t*rhoCount+r];
+      if(votes<Math.max(18,Math.round(Math.min(w,h)*.20)))continue;
+      let isMax=true;
+      for(let dt=-2;dt<=2&&isMax;dt++)for(let dr=-10;dr<=10;dr++){
+        if(dt===0&&dr===0)continue;
+        const nt=(t+dt+thetaCount)%thetaCount,nr=r+dr;
+        if(nr>=0&&nr<rhoCount&&acc[nt*rhoCount+nr]>votes){isMax=false;break;}
+      }
+      if(isMax)peaks.push({t,rho:r-diag,votes});
+    }
+  }
+  peaks.sort((a,b)=>b.votes-a.votes);
+  const selected=[];
+  for(const p of peaks){
+    if(selected.every(q=>{
+      let d=Math.abs(p.t-q.t);d=Math.min(d,thetaCount-d);
+      return d>2 || Math.abs(p.rho-q.rho)>12;
+    })){
+      selected.push(p);
+      if(selected.length>=36)break;
+    }
+  }
+  if(selected.length<4){
+    call('COURT NOT FOUND','I could not identify four clear white-tape lines. Try moving the camera or use Set court corners.');
+    return false;
+  }
+  // Form orientation families; each family needs two separated boundary lines.
+  const families=[];
+  for(const seed of selected){
+    let group=selected.filter(p=>{
+      let d=Math.abs(p.t-seed.t);d=Math.min(d,thetaCount-d);
+      return d<=8;
+    }).sort((a,b)=>b.votes-a.votes);
+    if(group.length<2)continue;
+    const pair=[];
+    for(const p of group){
+      if(pair.every(q=>Math.abs(p.rho-q.rho)>Math.max(18,Math.min(w,h)*.10)))pair.push(p);
+      if(pair.length===2)break;
+    }
+    if(pair.length===2){
+      const angle=seed.t;
+      if(families.every(f=>{let d=Math.abs(angle-f.angle);d=Math.min(d,thetaCount-d);return d>8;})){
+        families.push({angle,lines:pair,score:pair[0].votes+pair[1].votes});
+      }
+    }
+  }
+  let best=null;
+  for(let i=0;i<families.length;i++)for(let j=i+1;j<families.length;j++){
+    let d=Math.abs(families[i].angle-families[j].angle);d=Math.min(d,thetaCount-d);
+    if(d<55||d>90)continue;
+    const score=families[i].score+families[j].score;
+    if(!best||score>best.score)best={a:families[i],b:families[j],score};
+  }
+  if(!best){
+    call('COURT NOT FOUND','I found bright lines, but not two clear crossing pairs. Try Auto-detect again with the full court visible, or mark the corners manually.');
+    return false;
+  }
+  function intersect(l1,l2){
+    const a1=cos[l1.t],b1=sin[l1.t],c1=l1.rho;
+    const a2=cos[l2.t],b2=sin[l2.t],c2=l2.rho;
+    const det=a1*b2-a2*b1;
+    if(Math.abs(det)<.15)return null;
+    return {x:(c1*b2-c2*b1)/det,y:(a1*c2-a2*c1)/det};
+  }
+  const raw=[
+    intersect(best.a.lines[0],best.b.lines[0]),
+    intersect(best.a.lines[0],best.b.lines[1]),
+    intersect(best.a.lines[1],best.b.lines[1]),
+    intersect(best.a.lines[1],best.b.lines[0])
+  ];
+  if(raw.some(p=>!p||p.x<0||p.y<0||p.x>w||p.y>h)){
+    call('COURT NOT FOUND','The detected lines did not form a complete court inside the camera view. Move back so all four corners are visible, then retry.');
+    return false;
+  }
+  const cx=raw.reduce((s,p)=>s+p.x,0)/4,cy=raw.reduce((s,p)=>s+p.y,0)/4;
+  raw.sort((p,q)=>Math.atan2(p.y-cy,p.x-cx)-Math.atan2(q.y-cy,q.x-cx));
+  const area=Math.abs(raw.reduce((s,p,i)=>{const q=raw[(i+1)%4];return s+p.x*q.y-q.x*p.y;},0))/2;
+  if(area<w*h*.035 || area>w*h*.92){
+    call('COURT NOT FOUND','The possible court shape was too small or too large to trust. Keep the entire court in view and retry, or set the corners manually.');
+    return false;
+  }
+  // Convert to display-canvas coordinates, keeping a consistent clockwise order.
+  const ordered=raw.map(p=>({x:p.x/w*canvas.width,y:p.y/h*canvas.height}));
+  const topLeft=ordered.reduce((a,p)=>p.x+p.y<a.x+a.y?p:a);
+  const start=ordered.indexOf(topLeft);
+  court=ordered.slice(start).concat(ordered.slice(0,start));
+  corners=[];selecting=false;dragging=-1;
+  el('play').disabled=false;el('play').textContent='Start rally';updateCornerButtons();
+  call('COURT AUTO-DETECTED','Green outline added from the white tape. Check the four corners; drag any corner to correct it if needed.','Court detected');
+  return true;
+}
+
+function canvasPoint(ev){
+  const r=canvas.getBoundingClientRect();
+  return {x:(ev.clientX-r.left)*canvas.width/r.width,y:(ev.clientY-r.top)*canvas.height/r.height};
+}
+function nearestCorner(p){
+  const list=court.length===4?court:corners;
+  let idx=-1,best=canvas.width*.045;
+  list.forEach((q,i)=>{const d=Math.hypot(q.x-p.x,q.y-p.y);if(d<best){best=d;idx=i;}});
+  return idx;
+}
+function updateCornerButtons(){
+  el('undo').disabled=!(selecting&&corners.length>0);
+  el('clearcourt').disabled=!(court.length===4||corners.length>0);
+}
+function finishCourt(){
+  if(corners.length===4){
+    court=corners.map(p=>({...p}));selecting=false;dragging=-1;
+    el('play').disabled=false;updateCornerButtons();
+    call('COURT SAVED','Court saved. Drag any green numbered corner to adjust it.','Court set');
+  }
+}
+canvas.addEventListener('pointerdown',ev=>{
+  const p=canvasPoint(ev);
+  if(court.length===4&&!selecting){
+    const hit=nearestCorner(p);
+    if(hit>=0){dragging=hit;canvas.setPointerCapture(ev.pointerId);return;}
+  }
+  if(!selecting)return;
+  corners.push(p);updateCornerButtons();
+  if(corners.length===4)finishCourt();
+  else call((corners.length)+'/4 CORNERS','Tap the next corner. The magnifier helps you place it precisely.');
+});
+canvas.addEventListener('pointermove',ev=>{
+  const p=canvasPoint(ev);
+  if(dragging>=0){
+    court[dragging]=p;
+    const z=el('zoom'),zc=el('zoomcanvas'),zctx=zc.getContext('2d');
+    const size=canvas.width*.12;
+    z.style.display='block';
+    zctx.clearRect(0,0,zc.width,zc.height);
+    zctx.drawImage(canvas,Math.max(0,p.x-size/2),Math.max(0,p.y-size/2),size,size,0,0,zc.width,zc.height);
+    zctx.strokeStyle='#ff9638';zctx.lineWidth=3;zctx.beginPath();zctx.moveTo(110,0);zctx.lineTo(110,220);zctx.moveTo(0,110);zctx.lineTo(220,110);zctx.stroke();
+    return;
+  }
+  if(selecting){
+    const z=el('zoom'),zc=el('zoomcanvas'),zctx=zc.getContext('2d');
+    const size=canvas.width*.12;z.style.display='block';
+    zctx.clearRect(0,0,zc.width,zc.height);
+    zctx.drawImage(canvas,Math.max(0,p.x-size/2),Math.max(0,p.y-size/2),size,size,0,0,zc.width,zc.height);
+    zctx.strokeStyle='#ff9638';zctx.lineWidth=3;zctx.beginPath();zctx.moveTo(110,0);zctx.lineTo(110,220);zctx.moveTo(0,110);zctx.lineTo(220,110);zctx.stroke();
+  }
+});
+function stopDragging(){dragging=-1;el('zoom').style.display='none';}
+canvas.addEventListener('pointerup',stopDragging);
+canvas.addEventListener('pointercancel',stopDragging);
+function endPoint(reason){
+  if(pointFinished)return;
+  pointFinished=true;playing=false;pointCount++;el('points').textContent=pointCount;
+  el('play').textContent='Start rally';
+  const spoken=`${reason}. End of point. ${rallyCount} rallies.`;
+  call(`${reason.toUpperCase()} · END OF POINT`,
+       `Point ${pointCount} ended: ${reason.toLowerCase()}. Total rally count: ${rallyCount}. Tap Start rally for the next point.`,
+       spoken);
+}
+function detectBall(){
+  const sw=320,sh=Math.max(1,Math.round(canvas.height*sw/canvas.width));
+  const tmp=document.createElement('canvas');tmp.width=sw;tmp.height=sh;
+  const c=tmp.getContext('2d',{willReadFrequently:true});c.drawImage(canvas,0,0,sw,sh);
+  const data=c.getImageData(0,0,sw,sh).data, seen=new Uint8Array(sw*sh);
+  // Automatically adapt orange detection to the current camera brightness.
+  let brightness=0, samples=0;
+  for(let i=0;i<data.length;i+=4*24){brightness+=(data[i]+data[i+1]+data[i+2])/3;samples++;}
+  brightness=samples?brightness/samples:128;
+  const sens=Math.max(18,Math.min(55,34+(brightness-128)*0.12));
+  const min=Math.max(2,Math.round((sw*sh)/(320*180)*2));
+  const isOrange=i=>{const r=data[i],g=data[i+1],b=data[i+2];return r>Math.max(95,brightness*.78)&&g>30&&g<Math.min(225,r*.92)&&b<Math.min(r,g)*.78&&(r-b)>sens&&(r-g)>6;};
+  let best=null;
+  for(let y=1;y<sh-1;y+=1)for(let x=1;x<sw-1;x+=1){
+    const idx=y*sw+x;if(seen[idx]||!isOrange(idx*4))continue;
+    const stack=[idx];seen[idx]=1;let n=0,sx=0,sy=0,minx=x,maxx=x,miny=y,maxy=y;
+    while(stack.length){
+      const q=stack.pop(),qx=q%sw,qy=(q/sw)|0;n++;sx+=qx;sy+=qy;
+      minx=Math.min(minx,qx);maxx=Math.max(maxx,qx);miny=Math.min(miny,qy);maxy=Math.max(maxy,qy);
+      for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+        const nx=qx+dx,ny=qy+dy,np=ny*sw+nx;
+        if(nx>0&&nx<sw-1&&ny>0&&ny<sh-1&&!seen[np]&&isOrange(np*4)){seen[np]=1;stack.push(np);}
+      }
+    }
+    const bw=maxx-minx+1,bh=maxy-miny+1,ratio=bw/bh,fill=n/(bw*bh);
+    if(n>=min&&n<220&&ratio>.55&&ratio<1.8&&fill>.25&&(!best||n>best.n))best={x:sx/n/sw*canvas.width,y:sy/n/sh*canvas.height,n};
+  }
+  if(!best){
+    el('track').textContent='Searching';
+    if(!missStart)missStart=performance.now();
+    if(lastBall&&performance.now()-missStart>1800&&bounceCount>0)endPoint('Ball lost');
+    return;
+  }
+  missStart=0;el('track').textContent='FOUND';
+  const p={x:best.x,y:best.y},now=performance.now();
+  ctx.beginPath();ctx.arc(p.x,p.y,Math.max(8,canvas.width*.009),0,Math.PI*2);ctx.strokeStyle='#ff9638';ctx.lineWidth=4;ctx.stroke();
+  if(lastBall){
+    const dt=now-lastTime,dy=p.y-lastBall.y;
+    if(dt>35&&dt<300&&Math.abs(dy)>canvas.height*.002){
+      const direction=Math.sign(dy);
+      // Screen Y increases downward. Only a downward-to-upward reversal is treated
+      // as a possible ground bounce; upward-to-downward changes (often racket contact)
+      // are deliberately ignored.
+      if(lastDySign===1 && direction===-1 && now-lastTurn>650){
+        lastTurn=now;
+        if(inside(p,court)){
+          bounceCount++;
+          if(bounceCount===1){rallyCount++;el('rallies').textContent=rallyCount;call('IN','Ground bounce detected inside the court. Rally count +1.','In');}
+          else endPoint('Double bounce');
+        }else endPoint('Out');
+      }
+      if(direction!==0)lastDySign=direction;
+    }
+  }
+  lastBall=p;lastTime=now;
+}
+let lastDySign=0;
+el('camera').addEventListener('click',()=>{if(media)stopCamera();else startCamera();});
+el('autocourt').addEventListener('click',()=>autoDetectCourt());
+el('calibrate').addEventListener('click',()=>{
+  if(!media){call('START CAMERA FIRST','The camera must be running before you can mark the court.');return;}
+  playing=false;el('play').textContent='Start rally';corners=[];court=[];selecting=true;updateCornerButtons();
+  call('TAP 4 CORNERS','Tap top-left, top-right, bottom-right, bottom-left. Use the magnifier, then drag corners to fine-tune.','Set court corners');
+});
+el('undo').addEventListener('click',()=>{
+  if(selecting&&corners.length){corners.pop();updateCornerButtons();call(`${corners.length}/4 CORNERS`,'Last corner removed. Tap it again.');}
+});
+el('clearcourt').addEventListener('click',()=>{
+  playing=false;selecting=false;corners=[];court=[];el('play').disabled=true;el('play').textContent='Start rally';updateCornerButtons();
+  call('COURT CLEARED','Tap Set court corners to mark it again.');
+});
+el('play').addEventListener('click',()=>{
+  if(!media){call('START CAMERA FIRST','Start the camera first.');return;}
+  if(court.length!==4){call('SET COURT FIRST','Tap Set court corners and mark all four corners.');return;}
+  playing=!playing;el('play').textContent=playing?'Pause rally':'Start rally';
+  if(playing){bounceCount=0;pointFinished=false;lastBall=null;lastDySign=0;lastTurn=0;missStart=0;call('PLAY!','Tracking the orange ball. Calls are based on ground-bounce detection.','Play');}
+  else call('PAUSED','Tracking paused.','Paused');
+});
+el('voice').addEventListener('click',()=>{
+  voiceOn=!voiceOn;el('voice').textContent='Voice: '+(voiceOn?'ON':'OFF');
+  if(voiceOn)say('Voice referee on');else if('speechSynthesis'in window)window.speechSynthesis.cancel();
+});
+el('reset').addEventListener('click',()=>{
+  rallyCount=0;pointCount=0;bounceCount=0;pointFinished=false;playing=false;lastBall=null;lastDySign=0;
+  el('rallies').textContent='0';el('points').textContent='0';el('play').textContent='Start rally';
+  call('RESET','Counts reset. Camera and court calibration are unchanged.','Reset');
+});
+updateCornerButtons();
+window.addEventListener('error',ev=>{call('APP ERROR',ev.message||'A JavaScript error occurred.');});
+})();
+</script></body></html>
