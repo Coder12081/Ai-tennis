@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>MiniCourt AI v2</title>
+<style>
+:root{color-scheme:dark;--bg:#101a17;--panel:#1b2a24;--green:#a7efbd;--muted:#a9bbb0}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f3f7f4;font:16px system-ui,-apple-system,sans-serif}
+main{max-width:900px;margin:auto;padding:16px;display:grid;gap:12px}header{display:flex;justify-content:space-between;align-items:center;gap:10px}h1{font-size:23px;margin:0}
+.panel{background:var(--panel);border:1px solid #34483e;border-radius:16px;padding:14px}
+#view{width:100%;display:block;background:#080d0b;border-radius:12px;max-height:55vh;object-fit:contain}
+.controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}button{border:0;border-radius:11px;padding:12px 14px;background:#315c43;color:white;font-weight:650;font-size:14px}button.primary{background:#b5f3c5;color:#102016}button:disabled{opacity:.4}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.stat{background:#263a30;border-radius:12px;padding:10px}.stat strong{font-size:25px;display:block}.stat span,.muted,.note{color:var(--muted)}.stat span{font-size:11px}
+#call{text-align:center;font-size:27px;font-weight:850;color:var(--green);padding:10px}label{display:block;color:var(--muted);font-size:13px;margin:8px 0}input{width:100%}.note{font-size:13px;line-height:1.45}
+</style></head><body><main>
+<header><div><h1>🎾 MiniCourt AI</h1><div class="muted">Version 2 · ball-focused tracking</div></div><span id="status" class="muted">Camera off</span></header>
+<section class="panel">
+<video id="video" playsinline muted style="display:none"></video><canvas id="view"></canvas>
+<div class="controls"><button class="primary" id="camera">Start camera</button><button id="play" disabled>Start tracking</button><button id="voice">Voice: ON</button><button id="reset">Reset</button></div>
+<p class="note" id="instruction">Set the iPad safely in a fixed position with the whole taped court visible. Allow camera access. Use a brightly coloured ball if possible.</p>
+</section>
+<section class="panel"><div class="stats">
+<div class="stat"><span>TRACKED BALL EVENTS</span><strong id="events">0</strong></div><div class="stat"><span>LONGEST SEQUENCE</span><strong id="best">0</strong></div><div class="stat"><span>TRACK CONFIDENCE</span><strong id="confidence">—</strong></div>
+</div><div id="call">READY</div><p class="note" id="detail">This version looks for a small, round, bright-yellow object and ignores large moving regions such as a person. It is still experimental: it cannot yet reliably judge court lines or count real tennis strokes.</p></section>
+<section class="panel"><strong>Detection tuning</strong>
+<label>Yellow-ball sensitivity: <output id="sensval">42</output></label><input id="sensitivity" type="range" min="15" max="85" value="42">
+<label>Minimum ball size: <output id="sizeval">2</output></label><input id="minsize" type="range" min="1" max="12" value="2">
+<p class="note">If the ball is not highlighted, lower sensitivity. If floor reflections are highlighted, raise sensitivity or increase minimum ball size. Keep the camera still and avoid strong glare.</p></section>
+</main>
+<script>
+const video=document.querySelector('#video'),canvas=document.querySelector('#view'),ctx=canvas.getContext('2d',{willReadFrequently:true}),$=id=>document.getElementById(id);
+let stream=null,raf=0,tracking=false,voice=true,last=null,lastSeen=0,events=0,best=0,sequence=0,miss=0;
+function speak(s){if(!voice||!('speechSynthesis'in window))return;speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(s);u.rate=1.05;u.pitch=1;speechSynthesis.speak(u)}
+function announce(t,d,spoken){$('call').textContent=t;$('detail').textContent=d;if(spoken)speak(spoken)}
+$('voice').onclick=()=>{voice=!voice;$('voice').textContent='Voice: '+(voice?'ON':'OFF');if(voice)speak('Voice referee on')};
+$('camera').onclick=async()=>{try{if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;cancelAnimationFrame(raf);$('camera').textContent='Start camera';$('status').textContent='Camera off';return}
+stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});video.srcObject=stream;await video.play();canvas.width=video.videoWidth;canvas.height=video.videoHeight;$('camera').textContent='Stop camera';$('play').disabled=false;$('status').textContent='Camera on';loop()
+}catch(e){announce('CAMERA ERROR','Allow camera access in Safari. The page must be opened over HTTPS. '+e.message)}};
+$('play').onclick=()=>{tracking=!tracking;$('play').textContent=tracking?'Pause tracking':'Start tracking';last=null;sequence=0;miss=0;announce(tracking?'TRACKING':'PAUSED',tracking?'Looking only for a small bright-yellow ball.':'Tracking paused.',tracking?'Tracking started':'Tracking paused')};
+$('reset').onclick=()=>{events=best=sequence=0;$('events').textContent=$('best').textContent='0';announce('RESET','Statistics cleared.','Reset')};
+$('sensitivity').oninput=()=>{$('sensval').textContent=$('sensitivity').value};$('minsize').oninput=()=>{$('sizeval').textContent=$('minsize').value};
+function loop(){if(!stream)return;ctx.drawImage(video,0,0,canvas.width,canvas.height);if(tracking)detect();raf=requestAnimationFrame(loop)}
+function detect(){
+ const w=canvas.width,h=canvas.height,sw=320,sh=Math.round(h*sw/w),tmp=document.createElement('canvas');tmp.width=sw;tmp.height=sh;const c=tmp.getContext('2d',{willReadFrequently:true});c.drawImage(canvas,0,0,sw,sh);
+ const a=c.getImageData(0,0,sw,sh).data,seen=new Uint8Array(sw*sh),threshold=Number($('sensitivity').value),min=Number($('minsize').value);
+ function yellow(i){const r=a[i],g=a[i+1],b=a[i+2];return r>115&&g>115&&b<Math.min(r,g)*.68&&Math.abs(r-g)<105&&Math.max(r,g)-b>threshold}
+ let bestBlob=null;
+ for(let y=1;y<sh-1;y+=1)for(let x=1;x<sw-1;x++){let p=y*sw+x;if(seen[p]||!yellow(p*4))continue;
+  let stack=[p],count=0,minx=x,maxx=x,miny=y,maxy=y,sx=0,sy=0;seen[p]=1;
+  while(stack.length){let q=stack.pop(),qx=q%sw,qy=(q/sw)|0;count++;sx+=qx;sy+=qy;minx=Math.min(minx,qx);maxx=Math.max(maxx,qx);miny=Math.min(miny,qy);maxy=Math.max(maxy,qy);
+   for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){let nx=qx+dx,ny=qy+dy,np=ny*sw+nx;if(nx>0&&nx<sw-1&&ny>0&&ny<sh-1&&!seen[np]&&yellow(np*4)){seen[np]=1;stack.push(np)}}
+  }
+  const bw=maxx-minx+1,bh=maxy-miny+1,ratio=bw/bh,circularity=count/(bw*bh);
+  // Reject huge regions (person/clothing/furniture) and thin tape lines.
+  if(count>=min&&count<150&&ratio>.55&&ratio<1.8&&circularity>.22){if(!bestBlob||count>bestBlob.count)bestBlob={x:sx/count,y:sy/count,count}}
+ }
+ if(bestBlob){
+  const x=bestBlob.x/sw*w,y=bestBlob.y/sh*h;ctx.beginPath();ctx.arc(x,y,Math.max(10,w*.012),0,Math.PI*2);ctx.strokeStyle='#a7efbd';ctx.lineWidth=4;ctx.stroke();
+  $('confidence').textContent='Candidate';$('status').textContent='Ball candidate';
+  if(last){const dt=performance.now()-lastSeen,dist=Math.hypot(x-last.x,y-last.y);if(dt<700&&dist>w*.035){sequence++;if(sequence>events){events=sequence;$('events').textContent=events;best=Math.max(best,events);$('best').textContent=best}}
+   else if(dt>=700){sequence=0}}
+  last={x,y};lastSeen=performance.now();miss=0;
+ }else{
+  miss++;if(miss>5){$('confidence').textContent='Not found';$('status').textContent='Searching for ball'}
+  if(last&&performance.now()-lastSeen>1000){last=null;sequence=0}
+ }
+}
+</script></body></html>
